@@ -5,12 +5,13 @@ import requests
 import json
 from flask import Flask, request, redirect, render_template_string, jsonify
 from flask_cors import CORS
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
-CORS(app) # Cho phép Userscript gọi API
+CORS(app) 
 
 TOKENS_FILE = 'tokens.json'
-API_KEY = "KHOI_RENDER_SECRET_KEY_2024" # Mật khẩu bảo mật API (ông có thể đổi)
+API_KEY = "KHOI_RENDER_SECRET_KEY_2024" 
 
 def load_tokens():
     if os.path.exists(TOKENS_FILE):
@@ -24,6 +25,7 @@ def save_tokens():
 
 TOKENS = load_tokens()
 
+# HTML CÓ TÍCH HỢP AUTO-REFRESH (TỰ ĐỘNG F5 MỖI 3 GIÂY)
 HTML = """
 <!DOCTYPE html>
 <html>
@@ -40,10 +42,16 @@ HTML = """
         .die { color: #fff; background: #ff0000; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;}
         .wait { color: #000; background: #ccc; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;}
         .info { font-size: 12px; color: #555; margin-bottom: 5px; }
+        .blink { animation: blinker 1s linear infinite; }
+        @keyframes blinker { 50% { opacity: 0; } }
     </style>
+    <script>
+        // Tự động load lại trang mỗi 3 giây để cập nhật trạng thái realtime
+        setTimeout(function(){ window.location.reload(); }, 3000);
+    </script>
 </head>
 <body>
-    <h2>HỆ THỐNG NGÂM ACC 24/7 (AUTO SYNC)</h2>
+    <h2>HỆ THỐNG NGÂM ACC 24/7 (ULTIMATE SYNC)</h2>
     <form action="/add" method="POST" style="display:flex; gap:10px;">
         <input type="text" name="token" placeholder="Dán Token Discord vào đây..." required style="flex:1;">
         <button type="submit">Thêm Thủ Công</button>
@@ -58,7 +66,7 @@ HTML = """
                     <div>Trạng thái: 
                         {% if data.status == 'Live' %}<span class="live">Live (Sống)</span>
                         {% elif data.status == 'Die' %}<span class="die">Die (Chết)</span>
-                        {% else %}<span class="wait">{{ data.status }}</span>{% endif %}
+                        {% else %}<span class="wait blink">{{ data.status }}</span>{% endif %}
                     </div>
                 </div>
                 <form action="/delete/{{ token }}" method="POST">
@@ -73,40 +81,47 @@ HTML = """
 </html>
 """
 
+# Đa luồng: Check 1 token
+def check_single_token(token):
+    try:
+        res = requests.get('https://discord.com/api/v9/users/@me', headers={'Authorization': token}, timeout=5)
+        if res.status_code == 200: return 'Live'
+        elif res.status_code == 401: return 'Die'
+        else: return f'Lỗi {res.status_code}'
+    except Exception:
+        return 'Lỗi mạng'
+
+# Đa luồng: Check hàng loạt siêu tốc
+def check_all_tokens():
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        for token in list(TOKENS.keys()):
+            executor.submit(update_token_status, token)
+
+def update_token_status(token):
+    TOKENS[token]['status'] = check_single_token(token)
+    save_tokens()
+
+# Vòng lặp ngầm giữ acc sống
 def keep_alive_loop():
     while True:
-        for token in list(TOKENS.keys()):
-            try:
-                res = requests.get('https://discord.com/api/v9/users/@me', headers={'Authorization': token}, timeout=10)
-                if res.status_code == 200:
-                    TOKENS[token]['status'] = 'Live'
-                elif res.status_code == 401:
-                    TOKENS[token]['status'] = 'Die'
-                else:
-                    TOKENS[token]['status'] = f'Lỗi {res.status_code}'
-            except Exception:
-                TOKENS[token]['status'] = 'Lỗi mạng'
-        save_tokens()
-        time.sleep(45) 
+        check_all_tokens()
+        time.sleep(30) # Ping mỗi 30 giây siêu nhanh
 
 threading.Thread(target=keep_alive_loop, daemon=True).start()
 
-# API ĐỂ TOOL REG TRÊN ĐIỆN THOẠI BẮN TOKEN QUA
 @app.route('/api/sync', methods=['POST'])
 def api_sync():
-    # Kiểm tra mật khẩu API
     if request.headers.get('X-API-KEY') != API_KEY:
         return jsonify({"error": "Sai API KEY"}), 401
     
     data = request.json
     token = data.get('token')
-    email = data.get('email', 'Unknown')
-    username = data.get('username', 'Unknown')
-    
     if token:
-        TOKENS[token] = {'email': email, 'user': username, 'status': 'Đang check...'}
+        TOKENS[token] = {'email': data.get('email', 'Unknown'), 'user': data.get('username', 'Unknown'), 'status': 'Đang check...'}
         save_tokens()
-        return jsonify({"status": "success", "message": "Đã thêm token!"}), 200
+        # Check ngay lập tức không cần chờ vòng lặp
+        threading.Thread(target=update_token_status, args=(token,)).start()
+        return jsonify({"status": "success"}), 200
     return jsonify({"error": "Thiếu token"}), 400
 
 @app.route('/')
@@ -119,6 +134,7 @@ def add():
     if token:
         TOKENS[token] = {'email': 'Thủ công', 'user': 'Thủ công', 'status': 'Đang check...'}
         save_tokens()
+        threading.Thread(target=update_token_status, args=(token,)).start()
     return redirect('/')
 
 @app.route('/delete/<token>', methods=['POST'])
